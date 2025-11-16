@@ -1,0 +1,125 @@
+pipeline {
+    agent any
+    tools{
+        jdk 'jdk'
+        nodejs 'node17'
+        }
+    environment {
+        SCANNER_HOME=tool 'sonar-scanner'
+        }
+
+
+    stages {
+        stage('clean workspace'){
+            steps{
+                cleanWs()
+            }
+        }
+        stage('code checkout') {
+            steps {
+                git branch: 'main', credentialsId: 'gitpass', url: 'https://github.com/mushrifmulla/starbucks-kubernetes.git'
+            }
+        }
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('sonar') {
+                    sh ''' $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=starbucks \
+                    -Dsonar.projectKey=starbucks '''
+                }
+            }
+        }
+        stage('quality gate'){
+            steps {
+                script {
+                    waitForQualityGate abortPipeline: false, credentialsId: 'sonarqube-key1'
+                }
+            }
+        }
+
+        stage('Install Dependencies'){
+            steps{
+                sh '''
+                    echo "Installing npm packages..."
+                    npm install
+                '''
+            }
+        }
+        stage('Trivy Scan'){
+            steps{
+                sh "trivy fs . > trivyfs.txt"
+            }
+        }
+        stage('Docker Build and Push'){
+            steps{
+                withCredentials([usernamePassword(credentialsId: 'docker-login', passwordVariable: 'DOCKER_PASS', usernameVariable: 'DOCKER_USER')]) {
+                    sh '''
+                    docker build -t mushrifmulla/starbucks:latest .
+                    # login using credentials provided by withCredentials
+                    echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                    docker push mushrifmulla/starbucks:latest
+                    '''
+                }
+            }
+        }
+        stage('Trivy Image Scanning'){
+            steps{
+                sh "trivy image mushrifmulla/starbucks:latest > trivyimage.txt"
+            }
+        }
+        stage('Deploy to m3cloud1 Cluster'){
+            steps{
+                withCredentials([aws(accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'aws-cred', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                    dir('kubernetes'){
+                    script{
+                        sh '''
+                        echo "Verifying AWS credentials..."
+                        aws sts get-caller-identity
+
+                        echo "Configuring kubectl for EKS cluster..."
+                        aws eks update-kubeconfig --region eu-north-1 --name m3cloud1
+
+                        echo "Verifying kubeconfig..."
+                        kubectl config view
+
+                        echo "Deploying application to EKS..."
+                        kubectl apply -f manifest.yml
+                    
+                        echo "Verifying deployment..."
+                        kubectl get pods
+                        kubectl get svc
+                        '''
+                    }
+                }
+            }
+
+            }
+        }
+
+    }
+
+    post {
+        always {
+            script {
+                def buildStatus = currentBuild.currentResult
+                def buildUser = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')[0]?.userId ?: 'Github User'
+                emailext (
+                    subject: "Pipeline ${buildStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    body: """
+                        <p>This is a Jenkins starbucks CICD pipeline status.</p>
+                        <p>Project: ${env.JOB_NAME}</p>
+                        <p>Build Number: ${env.BUILD_NUMBER}</p>
+                        <p>Build Status: ${buildStatus}</p>
+                        <p>Started by: ${buildUser}</p>
+                        <p>Build URL: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                    """,
+                    to: 'mushrifmulla@gmail.com',
+                    from: 'mcube.rehman@gmail.com',
+                    replyTo: 'rayeesa.mushrif@gmail.com',
+                    mimeType: 'text/html',
+                    attachmentsPattern: 'trivyfs.txt,trivyimage.txt'
+                )
+            }
+        }
+    }
+
+}
